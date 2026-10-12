@@ -1,12 +1,6 @@
 """
 SU(3) × U(1)_D 共形窗口经典 Parton Shower — 12 种电荷、有限夸克质量。
 
-每个演化步先由积分分裂率构造 Sudakov 因子
-``Delta = exp(-lambda_total)``，再以 ``1 - Delta`` 的概率选择一次分裂。
-默认 flavor 演化采用 arXiv:2204.12500 的 physical-flavor Markov 基线：
-每次暗光子发射按 |G_ji|² 抽取 χ_i→χ_j。也可切换回逐事件固定 interaction
-eigenstate 的混合模型。本文件不维护量子态、不使用旋转角，也不依赖 Qiskit。
-
 基于 arXiv:2310.19881 (QVPS) 与 arXiv:2502.18566 (共形窗口簇射)。
 """
 
