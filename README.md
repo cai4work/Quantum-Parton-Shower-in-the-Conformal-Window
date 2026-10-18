@@ -10,27 +10,26 @@ use the same physics settings and save structured results for comparison.
 Use Python 3.10 and install the dependencies:
 
 python -m pip install -r requirements.txt
+
 ## Run
 
 Edit `Parameters.py` to set the physics parameters, event count, worker
-count, and output location. Its current defaults generate 100 events and evolve
-from 100 GeV^2 toward 0.0001 GeV^2.
+count, and output location.
 
-python QVPS_CW.py
-python Classic.py
-The two runs use the same experiment directory when their experiment settings,
-including `N_SHOTS`, match. Statevector runs can require substantial memory and
-time; choose `N_WORKERS` to fit the machine before increasing `N_SHOTS`.
+```
+python simulation_api.py --method qvps
+python simulation_api.py --method classic
+```
+
+`--method both`runs Classic followed by QVPS and is the default method.
 
 ## Files
 
 - `Parameters.py` — shared simulation settings.
+- `simulation_api.py` — command-line entry point, shared execution API, result storage and readers, and experiment index maintenance.
 - `QVPS_CW.py` — quantum-veto shower.
 - `Classic.py` — classical baseline.
 - `FlavorMixing.py` — flavor-basis mixing utilities.
-- `result_storage.py` — experiment directories, simulated data, and summaries.
-- `eec.py` — EEC analysis for QVPS mass scans.
-- `rebuild_experiments_index.py` — rebuild `experiments.csv` from experiment directories.
 
 ## Results
 
@@ -41,3 +40,4 @@ contains `events.parquet`, `particles.parquet`, `emissions.parquet`, and
 ## References
 
 - [QVPS in Conformal Window]
+

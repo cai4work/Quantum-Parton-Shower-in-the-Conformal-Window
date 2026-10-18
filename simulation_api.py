@@ -1,31 +1,34 @@
-"""Structured result storage shared by the QVPS and Classic simulators.
-
-Results are grouped by the parameters that define an experiment::
-
-    results/experiment-<short-hash>/<method>/run-XXX/
-
-Each run contains event, final-particle, and accepted-emission Parquet tables
-plus a JSON summary. Legacy comment-prefixed CSV files remain readable by the
-analysis helpers, but new runs do not create an event CSV duplicate.
-"""
+"""Shared simulation API, result storage, readers, and index maintenance."""
 
 from __future__ import annotations
 
+import argparse
 from collections import Counter
 import csv
 from datetime import datetime
 import hashlib
+import importlib
+import importlib.util
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import re
 import secrets
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
+from Parameters import BASELINE_PARAMETERS
+
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+# --- Result formats, experiment identity, storage, and data discovery ---
 
 SCHEMA_VERSION = "3.1"
 RESULTS_DIRNAME = "results"
@@ -66,12 +69,8 @@ EXPERIMENT_PARAMETER_KEYS = (
     "N_SHOTS",
 )
 
-# Parameters retained in each experiment record for interpretation, but not
-# hashed separately because their effective value is already represented by
-# an identity parameter (T2_END is discretized into MAX_STEPS).
-EXPERIMENT_RECORD_PARAMETER_KEYS = (
-    "T2_END",
-)
+# Retain the shared export for readers; no additional record parameters remain.
+EXPERIMENT_RECORD_PARAMETER_KEYS = ()
 
 # Keep the cross-experiment CSV compact. Parameters omitted here still remain
 # part of the experiment identity and the complete parameters.json snapshot.
@@ -81,7 +80,6 @@ EXPERIMENT_INDEX_PARAMETER_KEYS = (
     "Q_MIN",
     "Q_MAX",
     "t2_0",
-    "T2_END",
     "E0",
     "LAMBDA_D",
     "M_Q",
@@ -195,7 +193,7 @@ def resolve_results_root(base_dir: Path, params: Mapping[str, Any]) -> Path:
 def _configured_results_root(base_dir: Path) -> Path:
     """Use the shared configuration for discovery without making it mandatory."""
     try:
-        from Parameters import PARAMS
+        from Parameters import BASELINE_PARAMETERS as PARAMS
     except (ImportError, ModuleNotFoundError):
         return base_dir / RESULTS_DIRNAME
     return resolve_results_root(base_dir, PARAMS)
@@ -910,3 +908,382 @@ def discover_latest_runs_by_experiment(base_dir: Path, method: str) -> list[Path
     if not legacy:
         raise FileNotFoundError(f"No structured runs or legacy {prefix}*.csv files found")
     return [path for _, path in sorted(legacy)]
+
+
+# --- Simulation configuration and execution ---
+
+_SIMULATOR_MODULES = {"qvps": "QVPS_CW", "classic": "Classic"}
+_worker_simulator = None
+_worker_parameters = None
+
+
+def baseline_input_parameters():
+    """Read legacy input overrides without mutating the default baseline.
+
+    This is an input-layer helper for scripts. Programmatic calls with explicit
+    parameters do not implicitly read process environment variables.
+    """
+    params = dict(BASELINE_PARAMETERS)
+    for key in ("Q_MIN", "Q_MAX", "M_Q", "MIXING_STRENGTH"):
+        value = os.environ.get(f"QVPS_{key}")
+        if value is not None:
+            params[key] = float(value)
+    for key in ("N_SHOTS", "MAX_STEPS"):
+        value = os.environ.get(f"QVPS_{key}")
+        if value is not None:
+            params[key] = int(value)
+    return params
+
+
+def normalize_method(method):
+    try:
+        return MODE_DIRECTORIES[method.lower()]
+    except (AttributeError, KeyError) as exc:
+        raise ValueError(f"Unknown simulation method: {method!r}") from exc
+
+
+def mass_cutoff_steps(parameters):
+    """Return the grid steps needed to reach the physical mass cutoff."""
+    t2_0 = float(parameters["t2_0"])
+    r_step = float(parameters["R_STEP"])
+    mass = float(parameters["M_Q"])
+    if not math.isfinite(t2_0) or t2_0 <= 0.0:
+        raise ValueError("t2_0 must be finite and positive")
+    if not math.isfinite(r_step) or not 0.0 < r_step < 1.0:
+        raise ValueError("R_STEP must satisfy 0 < R_STEP < 1")
+    if not math.isfinite(mass) or mass <= 0.0:
+        raise ValueError("M_Q must be finite and positive")
+    log_ratio = math.log(4.0) + 2.0 * math.log(mass) - math.log(t2_0)
+    return max(0, int(math.ceil(log_ratio / math.log(r_step))))
+
+
+def prepare_parameters(parameters=None, *, shots=None, workers=None, random_seed=None,
+                       results_dir=None):
+    """Validate explicit step limits, defaulting to the baseline configuration."""
+    overrides = dict(parameters or {})
+    unknown = overrides.keys() - BASELINE_PARAMETERS.keys()
+    if unknown:
+        raise ValueError(f"Unknown parameters: {sorted(unknown)}")
+    params = {**BASELINE_PARAMETERS, **overrides}
+    if shots is not None:
+        params["N_SHOTS"] = shots
+    if workers is not None:
+        params["N_WORKERS"] = workers
+    if random_seed is not None:
+        params["RANDOM_SEED"] = random_seed
+    if results_dir is not None:
+        params["RESULTS_DIR"] = str(results_dir)
+    if params["N_WORKERS"] is None:
+        params["N_WORKERS"] = max(1, (os.cpu_count() or 1) // 2)
+    for key, minimum in (("N_SHOTS", 1), ("N_WORKERS", 1),
+                         ("PROGRESS_INTERVAL", 1), ("MAX_STEPS", 0), ("MAX_PAIRS", 0)):
+        value = params[key]
+        if isinstance(value, bool) or int(value) != value or int(value) < minimum:
+            raise ValueError(f"{key} must be an integer >= {minimum}")
+        params[key] = int(value)
+    for key in ("t2_0", "E0", "LAMBDA_D", "M_Q"):
+        if not math.isfinite(float(params[key])) or float(params[key]) <= 0.0:
+            raise ValueError(f"{key} must be finite and positive")
+    if not 0.0 < float(params["R_STEP"]) < 1.0:
+        raise ValueError("R_STEP must satisfy 0 < R_STEP < 1")
+    return params
+
+
+def experiment_directory(parameters, base_dir=BASE_DIR):
+    """Locate an experiment using the existing identity and directory rules."""
+    fingerprint = parameter_fingerprint(select_experiment_parameters(parameters))
+    root = resolve_results_root(Path(base_dir), parameters)
+    for candidate in sorted(root.glob("experiment-*")):
+        path = candidate / "parameters.json"
+        if not path.is_file():
+            continue
+        with path.open(encoding="utf-8") as handle:
+            document = json.load(handle)
+        if document.get("parameter_fingerprint") == fingerprint:
+            return candidate
+    return root / f"experiment-{fingerprint[:10]}"
+
+
+def completed_run(experiment_dir, method, *, random_seed=None, requested_events=None):
+    """Return the latest completed, nonempty run with consistent event counts."""
+    candidates = []
+    for run_dir in (Path(experiment_dir) / normalize_method(method)).glob("run-*"):
+        summary_path = run_dir / "summary.json"
+        events_path = run_dir / "events.parquet"
+        if not summary_path.is_file() or not events_path.is_file() or events_path.stat().st_size == 0:
+            continue
+        try:
+            with summary_path.open(encoding="utf-8") as handle:
+                summary = json.load(handle)
+            valid = int(summary["valid_events"])
+            dropped = int(summary["dropped_events"])
+            requested = int(summary["requested_events"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if (summary.get("status") == "completed" and valid > 0 and dropped >= 0
+                and valid + dropped == requested):
+            if random_seed is not None and summary.get("random_seed") != int(random_seed):
+                continue
+            if requested_events is not None and requested != int(requested_events):
+                continue
+            candidates.append((str(summary.get("finished_at", "")), run_dir.name, run_dir, summary))
+    if not candidates:
+        return None
+    _, _, run_dir, summary = max(candidates, key=lambda item: item[:2])
+    return {"run_dir": run_dir, "summary": summary}
+
+
+def has_completed_run(experiment_dir, method):
+    return completed_run(experiment_dir, method) is not None
+
+
+def require_simulator(method):
+    method = normalize_method(method)
+    if method == "qvps" and importlib.util.find_spec("qiskit") is None:
+        raise ModuleNotFoundError("Qiskit is required for QVPS; run in the qsimu Conda environment")
+    return importlib.import_module(_SIMULATOR_MODULES[method])
+
+
+def _initialize_worker(method, parameters):
+    global _worker_simulator, _worker_parameters
+    _worker_simulator = require_simulator(method)
+    _worker_parameters = dict(parameters)
+    # Matrix-logarithm setup can consume NumPy RNG state on its first call.
+    # Finish it before simulate_event sets each event's independent seed.
+    _worker_simulator.CWKinematics12(_worker_parameters)
+
+
+def _run_worker(seed):
+    return _worker_simulator.simulate_event(_worker_parameters, seed)
+
+
+def _collect_events(method, parameters, root_seed, progress):
+    seeds = [s.generate_state(1)[0] for s in np.random.SeedSequence(root_seed).spawn(parameters["N_SHOTS"])]
+    events = []
+    dropped = 0
+    start = time.time()
+
+    def consume(iterator):
+        nonlocal dropped
+        for done, event in enumerate(iterator, start=1):
+            if event is None:
+                dropped += 1
+            else:
+                events.append(event)
+            if progress and (done % parameters["PROGRESS_INTERVAL"] == 0 or done == len(seeds)):
+                elapsed = time.time() - start
+                rate = done / elapsed if elapsed > 0 else 0.0
+                eta = (len(seeds) - done) / rate if rate > 0 else 0.0
+                print(f"  {done:>6d}/{len(seeds)} ({elapsed:.1f}s, {rate:.0f} shots/s, ETA {eta:.0f}s)")
+
+    if parameters["N_WORKERS"] == 1:
+        simulator = require_simulator(method)
+        consume(simulator.simulate_event(parameters, seed) for seed in seeds)
+    else:
+        with mp.Pool(parameters["N_WORKERS"], initializer=_initialize_worker,
+                     initargs=(method, parameters)) as pool:
+            consume(pool.imap_unordered(_run_worker, seeds, chunksize=32))
+    return events, dropped, time.time() - start
+
+
+def _encode_particles(particles):
+    return "|".join(f"{pid}:{kind}:{x:.17g}:{tx:.17g}:{ty:.17g}"
+                    for pid, kind, x, tx, ty in particles)
+
+
+def _encode_emissions(emissions):
+    return "|".join(
+        f"{index}:{step}:{channel}:{pid}:{kind}:{t2:.17g}:{z:.17g}:{x:.17g}"
+        for index, (step, channel, pid, kind, t2, z, x) in enumerate(emissions, start=1)
+    )
+
+
+def run_simulation(method, parameters=None, *, shots=None, workers=None,
+                   random_seed=None, results_dir=None, reuse_existing=True,
+                   save=True, progress=True, dry_run=False, base_dir=BASE_DIR):
+    """Run one effective configuration and return counts, paths, and reuse status.
+
+    With save=False, return physical event records in ``events`` as well.
+    Entry-point scripts using multiple workers must have a __main__ guard.
+    """
+    method = normalize_method(method)
+    params = prepare_parameters(parameters, shots=shots, workers=workers,
+                                random_seed=random_seed, results_dir=results_dir)
+    directory = experiment_directory(params, base_dir)
+    previous = (completed_run(directory, method, random_seed=params.get("RANDOM_SEED"),
+                              requested_events=params["N_SHOTS"])
+                if save and reuse_existing else None)
+    if previous is not None:
+        summary = previous["summary"]
+        if progress:
+            print(f"{method}: reusing {previous['run_dir']}")
+        return {"reused": True, "parameters": params, "experiment_dir": directory,
+                "run_dir": previous["run_dir"], "experiment_id": summary["experiment_id"],
+                "run_id": summary["run_id"], "valid_events": summary["valid_events"],
+                "dropped_events": summary["dropped_events"], "random_seed": summary["random_seed"]}
+    if dry_run:
+        if progress:
+            print(f"{method}: would run MAX_STEPS={params['MAX_STEPS']}, shots={params['N_SHOTS']}, experiment={directory.name}")
+        return {"reused": False, "dry_run": True, "parameters": params, "experiment_dir": directory}
+    simulator = require_simulator(method)
+    if method == "qvps" and (params["QUBITS_PER_FERMION"] != 4 or not 1 <= params["N_CHARGE"] <= 16):
+        raise ValueError("The current QVPS flavor encoding requires 4 qubits and 1..16 charges")
+    kin = simulator.CWKinematics12(params)
+    root_seed = resolve_random_seed(params.get("RANDOM_SEED"))
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    if progress:
+        print(f"{method}: {params['N_SHOTS']} events, {params['N_WORKERS']} workers, MAX_STEPS={params['MAX_STEPS']}")
+    events, dropped, wall = _collect_events(method, params, root_seed, progress)
+    result = {"reused": False, "parameters": params, "experiment_dir": directory,
+              "valid_events": len(events), "dropped_events": dropped,
+              "random_seed": root_seed, "wall_time_s": wall}
+    if not save:
+        result["events"] = events
+    if save and events:
+        metadata_fn = _qvps_metadata if method == "qvps" else _classic_metadata
+        result.update(save_simulation_results(
+            base_dir=Path(base_dir), params=params, mode=method,
+            simulation_metadata=dict(metadata_fn(params, kin, len(events), dropped, wall)),
+            n_ph=[event.n_ph for event in events], n_gl=[event.n_gl for event in events],
+            mass_state=[event.mass_state for event in events],
+            final_particles=[_encode_particles(event.final_particles) for event in events],
+            final_flavors=(["|".join(f"{pid}:{flavor}" for pid, flavor in event.final_flavors)
+                            for event in events] if method == "classic" else None),
+            final_emissions=[_encode_emissions(event.final_emissions) for event in events],
+            dropped_events=dropped, wall_time_s=wall, random_seed=root_seed, started_at=started_at,
+        ))
+    if progress:
+        print(f"  Valid: {len(events)}, Dropped: {dropped}, Wall time: {wall:.1f}s")
+        if "run_dir" in result:
+            print(f"  Data saved: {result['run_dir']}")
+    return result
+
+
+def _qvps_metadata(params, kin, n_valid, n_fail, wall):
+    return [
+        ("mode", "quantum"),
+        ("N_SHOTS", params["N_SHOTS"]),
+        ("valid_events", n_valid),
+        ("dropped_events", n_fail),
+        ("wall_time_s", f"{wall:.6f}"),
+        ("N_WORKERS", params["N_WORKERS"]),
+        ("PROGRESS_INTERVAL", params["PROGRESS_INTERVAL"]),
+        ("N_C", kin.N_C),
+        ("N_F", kin.N_F),
+        ("N_CHARGE", kin.N_CHARGE),
+        ("MIXING_STRENGTH", kin.mixing_strength),
+        ("initial_physical_flavor", params.get("INITIAL_PHYSICAL_FLAVOR", 0)),
+        ("ALPHA_D", kin.alpha_D),
+        ("Q_MIN", params["Q_MIN"]),
+        ("Q_MAX", params["Q_MAX"]),
+        ("t2_0", kin.t2_0),
+        ("E0", params["E0"]),
+        ("LAMBDA_D", kin.lambda_d),
+        ("M_Q", kin.M_q),
+        ("t2_MIN", kin.t2_MIN),
+        ("R_STEP", params["R_STEP"]),
+        ("OVERESTIMATE_FACTOR", params["OVERESTIMATE_FACTOR"]),
+        ("MAX_STEPS", params["MAX_STEPS"]),
+        ("MAX_PAIRS", params["MAX_PAIRS"]),
+        ("ENABLE_Q_TO_Q_G", params["ENABLE_Q_TO_Q_G"]),
+        ("ENABLE_Q_TO_Q_DP", params["ENABLE_Q_TO_Q_DP"]),
+        ("ENABLE_G_TO_GG", params["ENABLE_G_TO_GG"]),
+        ("ENABLE_G_TO_QQ", params["ENABLE_G_TO_QQ"]),
+        ("ENABLE_DP_TO_QQ", params["ENABLE_DP_TO_QQ"]),
+    ]
+
+
+def _classic_metadata(params, kin, n_valid, n_fail, wall):
+    return [
+        ("mode", "classical"),
+        ("classical_flavor_model", params.get(
+            "CLASSICAL_FLAVOR_SCHEME", "paper_physical_markov"
+        )),
+        ("initial_physical_flavor", params.get("INITIAL_PHYSICAL_FLAVOR", 0)),
+        ("physical_coupling_matrix", "U_diag_Q_Udagger"),
+        ("mass_state_semantics", (
+            "physical_flavor_of_initial_fermion"
+            if params.get("CLASSICAL_FLAVOR_SCHEME", "paper_physical_markov")
+            == "paper_physical_markov"
+            else "mixing_matrix_measurement_of_initial_interaction_eigenstate"
+        )),
+        ("sudakov_scheme", "stepwise_exp_integrated_rate"),
+        ("qiskit_required", False),
+        ("N_SHOTS", params["N_SHOTS"]),
+        ("valid_events", n_valid),
+        ("dropped_events", n_fail),
+        ("wall_time_s", f"{wall:.6f}"),
+        ("N_WORKERS", params["N_WORKERS"]),
+        ("PROGRESS_INTERVAL", params["PROGRESS_INTERVAL"]),
+        ("N_C", kin.N_C),
+        ("N_F", kin.N_F),
+        ("N_CHARGE", kin.N_CHARGE),
+        ("MIXING_STRENGTH", kin.mixing_strength),
+        ("ALPHA_D", kin.alpha_D),
+        ("Q_MIN", params["Q_MIN"]),
+        ("Q_MAX", params["Q_MAX"]),
+        ("t2_0", kin.t2_0),
+        ("E0", params["E0"]),
+        ("LAMBDA_D", kin.lambda_d),
+        ("M_Q", kin.M_q),
+        ("t2_MIN", kin.t2_MIN),
+        ("R_STEP", params["R_STEP"]),
+        ("OVERESTIMATE_FACTOR", params["OVERESTIMATE_FACTOR"]),
+        ("MAX_STEPS", params["MAX_STEPS"]),
+        ("MAX_PAIRS", params["MAX_PAIRS"]),
+        ("ENABLE_Q_TO_Q_G", params["ENABLE_Q_TO_Q_G"]),
+        ("ENABLE_Q_TO_Q_DP", params["ENABLE_Q_TO_Q_DP"]),
+        ("ENABLE_G_TO_GG", params["ENABLE_G_TO_GG"]),
+        ("ENABLE_G_TO_QQ", params["ENABLE_G_TO_QQ"]),
+        ("ENABLE_DP_TO_QQ", params["ENABLE_DP_TO_QQ"]),
+    ]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the CW baseline or rebuild its experiment index")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--method", choices=("qvps", "classic", "both"), default="both")
+    action.add_argument("--rebuild-index", action="store_true",
+                        help="Rebuild experiments.csv from parameters.json without running simulations")
+    parser.add_argument("--shots", type=int)
+    parser.add_argument("--workers", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--results-dir", type=Path)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--rerun", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if args.rebuild_index:
+        if args.rerun or any(value is not None for value in
+                             (args.shots, args.workers, args.seed, args.max_steps)):
+            parser.error("--rebuild-index cannot be combined with simulation execution options")
+        params = dict(BASELINE_PARAMETERS)
+        if args.results_dir is not None:
+            params["RESULTS_DIR"] = str(args.results_dir)
+        results_root = resolve_results_root(BASE_DIR, params)
+        if not results_root.is_dir():
+            raise SystemExit(f"Results directory not found: {results_root}")
+        if args.dry_run:
+            print(f"Would rebuild {results_root / 'experiments.csv'}")
+            return
+        index_path = rebuild_experiments_index(results_root)
+        with index_path.open(newline="", encoding="utf-8") as handle:
+            count = sum(1 for _ in csv.DictReader(handle))
+        print(f"Updated {index_path}")
+        print(f"Indexed experiments: {count}")
+        return
+    overrides = baseline_input_parameters()
+    if args.max_steps is not None:
+        overrides["MAX_STEPS"] = args.max_steps
+    params = prepare_parameters(overrides, shots=args.shots, workers=args.workers,
+                                random_seed=args.seed, results_dir=args.results_dir)
+    methods = ("classic", "qvps") if args.method == "both" else (args.method,)
+    for method in methods:
+        if args.dry_run:
+            print(f"{method}: MAX_STEPS={params['MAX_STEPS']}, shots={params['N_SHOTS']}, experiment={experiment_directory(params)}")
+        else:
+            run_simulation(method, params, reuse_existing=not args.rerun)
+
+
+if __name__ == "__main__":
+    main()
