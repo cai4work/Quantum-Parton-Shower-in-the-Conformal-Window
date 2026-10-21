@@ -37,7 +37,18 @@ Runs are saved under `results/experiment-*/{qvps,classic}/run-*/`. Each run
 contains `events.parquet`, `particles.parquet`, `emissions.parquet`, and
 `summary.json`.
 
-## References
+## Citation
 
-- [QVPS in Conformal Window]
+```bibtex
+@article{Cai:2026qod,
+    author = {Cai, Nongqiu and Deng, Xu and Li, Jinmian and Long, Bingwei and Yang, Shuo},
+    title = {Quantum Veto Parton Shower Algorithm in the Conformal Window},
+    eprint = {2610.25189},
+    archivePrefix = {arXiv},
+    primaryClass = {hep-ph},
+    month = {10},
+    year = {2026},
+    url = {https://arxiv.org/abs/2610.25189}
+}
+```
 
